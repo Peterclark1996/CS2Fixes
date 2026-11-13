@@ -58,7 +58,9 @@ static void RemoveLeader(CCSPlayerController* ccsPly);
 CConVar<bool> g_cvarEnableLeader(
 	"cs2f_leader_enable", FCVAR_NONE, "Whether to enable Leader features", false,
 	[](CConVar<bool>* cvar, CSplitScreenSlot slot, const bool* new_val, const bool* old_val) {
-		if ((new_val && *new_val) || !GetGlobals())
+		// The entity system can be null while a map is loading (e.g. cfg re-exec toggling 1 -> 0 -> 1),
+		// and player lookups below would then crash
+		if ((new_val && *new_val) || !GetGlobals() || !g_pEntitySystem)
 			return;
 
 		// Remove all active leaders if disabling convar
