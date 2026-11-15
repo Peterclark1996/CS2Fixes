@@ -45,6 +45,8 @@ CConVar<float> g_cvarVoteMapsCooldownRng("cs2f_vote_maps_cooldown_rng", FCVAR_NO
 CConVar<int> g_cvarVoteMaxNominations("cs2f_vote_max_nominations", FCVAR_NONE, "Number of nominations to include per vote, out of a maximum of 10", 10, true, 0, true, 10);
 CConVar<int> g_cvarVoteMaxMaps("cs2f_vote_max_maps", FCVAR_NONE, "Number of total maps to include per vote, including nominations, out of a maximum of 10", 10, true, 2, true, 10);
 CConVar<int> g_cvarVoteBypassCooldownMaxCount("cs2f_vote_bypass_cd_max_count", FCVAR_NONE, "Maximum amount of players allowed to enable bypassing map cooldowns", 0, true, 0, false, 0);
+CConVar<bool> g_cvarVoteWorkshopNominations("cs2f_vote_workshop_nominations", FCVAR_NONE, "Whether players can nominate any CS2 workshop map by its ID, even if it's not in the map list", false);
+CConVar<int> g_cvarVoteWorkshopNominationsMax("cs2f_vote_workshop_nominations_max", FCVAR_NONE, "Maximum number of workshop maps that can be added to the map list through nominations (resets on map list reload)", 20, true, 1, false, 0);
 
 CON_COMMAND_CHAT_FLAGS(reload_map_list, "- Reload map list, also reloads current map on completion", ADMFLAG_ROOT)
 {
@@ -90,7 +92,7 @@ CON_COMMAND_CHAT_FLAGS(setnextmap, "[name/id] - Force next map (empty to clear f
 	g_pMapVoteSystem->ForceNextMap(player, args.ArgC() < 2 ? "" : args[1]);
 }
 
-CON_COMMAND_CHAT(nominate, "[mapname] - Nominate a map (empty to clear nomination or list all maps)")
+CON_COMMAND_CHAT(nominate, "[mapname/workshop id] - Nominate a map (empty to clear nomination or list all maps)")
 {
 	if (!g_cvarVoteManagerEnable.Get() || !player)
 		return;
@@ -245,12 +247,18 @@ void CMapVoteSystem::StartVote()
 	m_bIsVoteOngoing = true;
 
 	// Select random maps that meet requirements to appear
+	// Workshop nomination maps are never picked at random, they can only get in through nominations
 	std::vector<int> vecPossibleMaps;
 	for (int i = 0; i < GetMapListSize(); i++)
-		if (GetMapByIndex(i)->IsAvailable())
+		if (GetMapByIndex(i)->IsAvailable() && !GetMapByIndex(i)->IsWorkshopNomination())
 			vecPossibleMaps.push_back(i);
 
-	m_iVoteSize = std::min((int)vecPossibleMaps.size(), g_cvarVoteMaxMaps.Get());
+	int iNominatedWorkshopMaps = 0;
+	for (auto& pair : GetNominatedMaps())
+		if (GetMapByIndex(pair.first)->IsWorkshopNomination())
+			iNominatedWorkshopMaps++;
+
+	m_iVoteSize = std::min((int)vecPossibleMaps.size() + std::min(iNominatedWorkshopMaps, g_cvarVoteMaxNominations.Get()), g_cvarVoteMaxMaps.Get());
 	bool bAbort = false;
 	std::shared_ptr<CMap> pAlternativeMap;
 
@@ -342,6 +350,8 @@ void CMapVoteSystem::StartVote()
 		g_pGameRules->m_nEndMatchMapGroupVoteOptions.NetworkStateChanged();
 	}
 
+	bool bHasWorkshopNomination = false;
+
 	for (int i = 0; i < m_iVoteSize; i++)
 	{
 		int iMapIndex = g_pGameRules->m_nEndMatchMapGroupVoteOptions[i];
@@ -349,9 +359,29 @@ void CMapVoteSystem::StartVote()
 
 		Message("The %d-th chosen map index %d is %s\n", i, iMapIndex, GetMapName(iMapIndex));
 
+		if (GetMapByIndex(iMapIndex)->IsWorkshopNomination())
+			bHasWorkshopNomination = true;
+
 		// Map migrations need map info ahead of time
 		if (iWorkshopId != 0)
 			CMapSystemWorkshopDetailsQuery::Create(iWorkshopId);
+	}
+
+	// Workshop nominations were added to the map group mid-map, and clients may still show the map group they
+	// received on connect, so also spell out the options in chat (in vote panel order)
+	if (bHasWorkshopNomination)
+	{
+		ClientPrintAll(HUD_PRINTTALK, CHAT_PREFIX "Map vote options:");
+
+		for (int i = 0; i < m_iVoteSize; i++)
+		{
+			auto pMap = GetMapByIndex(g_pGameRules->m_nEndMatchMapGroupVoteOptions[i]);
+
+			if (pMap->IsWorkshopNomination())
+				ClientPrintAll(HUD_PRINTTALK, "%d. \x06%s\x01 (workshop %llu)", i + 1, pMap->GetName(), pMap->GetWorkshopId());
+			else
+				ClientPrintAll(HUD_PRINTTALK, "%d. \x06%s\x01", i + 1, pMap->GetName());
+		}
 	}
 
 	static ConVarRefAbstract mp_endmatch_votenextleveltime("mp_endmatch_votenextleveltime");
@@ -752,12 +782,122 @@ void CMapVoteSystem::AttemptNomination(CCSPlayerController* pController, const c
 		return;
 	}
 
+	// Workshop ID that isn't in the map list: look it up on the workshop and add it as a nominatable map
+	uint64 iWorkshopId = V_StringToUint64(pszMapSubstring, 0, NULL, NULL, PARSING_FLAG_SKIP_WARNING);
+
+	if (g_cvarVoteWorkshopNominations.Get() && iWorkshopId != 0 && GetMapsFromSubstring(pszMapSubstring).empty())
+	{
+		// Already known (maplist.jsonc or an earlier workshop nomination), nominate it normally so admin settings like enabled still apply
+		auto pExistingMap = GetMapInfoByIdentifiers("", iWorkshopId).second;
+
+		if (pExistingMap)
+		{
+			NominateMap(pController, pExistingMap);
+			return;
+		}
+
+		if (GetWorkshopNominationMapCount() >= g_cvarVoteWorkshopNominationsMax.Get())
+		{
+			ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "Cannot nominate new workshop maps, the limit of \x06%i\x01 has been reached. Try nominating one already added (see !maplist).", g_cvarVoteWorkshopNominationsMax.Get());
+			return;
+		}
+
+		// Apply the nominate rate limit before the lookup, so rate limited players can't fill up the map list
+		ZEPlayer* pPlayer = g_playerManager->GetPlayer(iSlot);
+
+		if (pPlayer && pPlayer->GetNominateTime() + 60.0f > GetGlobals()->curtime)
+		{
+			int iRemainingTime = (int)(pPlayer->GetNominateTime() + 60.0f - GetGlobals()->curtime);
+			ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "Wait %i seconds before you can nominate again.", iRemainingTime);
+			return;
+		}
+
+		ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "Looking up workshop map \x06%llu\x01...", iWorkshopId);
+
+		CMapSystemWorkshopDetailsQuery::Create(iWorkshopId, pController, [](std::shared_ptr<CMap> pMap, CCSPlayerController* pController) {
+			if (!pController)
+				return;
+
+			int iMapIndex = g_pMapVoteSystem->AddWorkshopNominationMap(pMap->GetName(), pMap->GetWorkshopId());
+
+			if (iMapIndex == -1)
+			{
+				ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "Cannot nominate new workshop maps, the limit of \x06%i\x01 has been reached.", g_cvarVoteWorkshopNominationsMax.Get());
+				return;
+			}
+
+			g_pMapVoteSystem->NominateMap(pController, g_pMapVoteSystem->GetMapByIndex(iMapIndex));
+		}, true);
+
+		return;
+	}
+
 	g_pMapVoteSystem->HandlePlayerMapLookup(pController, pszMapSubstring, false, [](std::shared_ptr<CMap> pMap, CCSPlayerController* pController) {
+		g_pMapVoteSystem->NominateMap(pController, pMap);
+	});
+}
+
+int CMapVoteSystem::GetWorkshopNominationMapCount()
+{
+	return std::count_if(m_vecMapList.begin(), m_vecMapList.end(), [](std::shared_ptr<CMap> pMap) { return pMap->IsWorkshopNomination(); });
+}
+
+int CMapVoteSystem::AddWorkshopNominationMap(const char* pszTitle, uint64 iWorkshopId)
+{
+	// Another player may have added it while this lookup was in flight
+	auto pair = GetMapInfoByIdentifiers("", iWorkshopId);
+
+	if (pair.first != -1)
+		return pair.first;
+
+	if (GetWorkshopNominationMapCount() >= g_cvarVoteWorkshopNominationsMax.Get())
+		return -1;
+
+	// Keep titles to a sane length for chat & the vote panel
+	std::string strTitle = pszTitle;
+
+	if (strTitle.length() > 64)
+		strTitle = strTitle.substr(0, 64);
+
+	auto pMap = std::make_shared<CMap>(strTitle, iWorkshopId, false, "", true);
+	pMap->SetWorkshopNomination(true);
+	m_vecMapList.push_back(pMap);
+
+	Message("Workshop map %llu (%s) was added to the map list through a nomination, map index %d\n", iWorkshopId, strTitle.c_str(), GetMapListSize() - 1);
+
+	// Rebuild the workshop map group so the new map has an entry for the end of match vote
+	CALL_VIRTUAL(void, g_GameConfig->GetOffset("IGameTypes_CreateWorkshopMapGroup"), g_pGameTypes, "workshop");
+
+	return GetMapListSize() - 1;
+}
+
+void CMapVoteSystem::NominateMap(CCSPlayerController* pController, std::shared_ptr<CMap> pMap)
+{
+	// Re-check state that may have changed during an async workshop lookup
+	if (!GetGlobals() || !pController)
+		return;
+
+	if (GetForcedNextMap())
+	{
+		ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "Nominations are disabled because the next map has been forced to \x06%s\x01.", GetForcedNextMap()->GetName());
+		return;
+	}
+
+	if (IsVoteOngoing())
+	{
+		ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "Nominations are disabled because the vote has already started.");
+		return;
+	}
+
+	{
 		int iPlayerCount = g_playerManager->GetOnlinePlayerCount(false);
 		int iMapIndex = g_pMapVoteSystem->GetMapInfoByIdentifiers(pMap->GetName(), pMap->GetWorkshopId()).first;
 
 		int iSlot = pController->GetPlayerSlot();
 		ZEPlayer* pPlayer = g_playerManager->GetPlayer(iSlot);
+
+		if (!pPlayer || iMapIndex == -1)
+			return;
 
 		if (!pMap->IsEnabled())
 		{
@@ -801,7 +941,7 @@ void CMapVoteSystem::AttemptNomination(CCSPlayerController* pController, const c
 
 		ClientPrintAll(HUD_PRINTTALK, CHAT_PREFIX "\x06%s \x01was nominated by %s. It now has %d nomination%s.", pMap->GetName(), pController->GetPlayerName(), iNominations, iNominations > 1 ? "s" : "");
 		pPlayer->SetNominateTime(GetGlobals()->curtime);
-	});
+	}
 }
 
 void CMapVoteSystem::PrintMapList(CCSPlayerController* pController)
@@ -822,7 +962,8 @@ void CMapVoteSystem::PrintMapList(CCSPlayerController* pController)
 
 	for (auto pMap : vecSortedMaps)
 	{
-		const char* name = pMap->GetName();
+		std::string strName = pMap->IsWorkshopNomination() ? std::string(pMap->GetName()) + " [workshop " + std::to_string(pMap->GetWorkshopId()) + "]" : pMap->GetName();
+		const char* name = strName.c_str();
 		int minPlayers = pMap->GetMinPlayers();
 		int maxPlayers = pMap->GetMaxPlayers();
 
@@ -957,6 +1098,12 @@ bool CMapVoteSystem::LoadMapList()
 	// This is called when the Steam API is init'd, now is the time to register this
 	m_CallbackDownloadItemResult.Register(this, &CMapVoteSystem::OnMapDownloaded);
 
+	// Keep maps players added through workshop nominations, so their cooldowns & current map checks keep working
+	std::vector<std::shared_ptr<CMap>> vecWorkshopNominationMaps;
+	for (auto pMap : m_vecMapList)
+		if (pMap->IsWorkshopNomination())
+			vecWorkshopNominationMaps.push_back(pMap);
+
 	m_vecMapList.clear();
 	m_vecGroups.clear();
 	m_vecCooldowns.clear();
@@ -1018,6 +1165,11 @@ bool CMapVoteSystem::LoadMapList()
 			}
 		}
 	}
+
+	// Re-append workshop nominations, unless an admin has since added that workshop ID to maplist.jsonc
+	for (auto pMap : vecWorkshopNominationMaps)
+		if (GetMapInfoByIdentifiers("", pMap->GetWorkshopId()).first == -1)
+			m_vecMapList.push_back(pMap);
 
 	m_pDownloadProgressTimer = CTimer::Create(0.f, TIMERFLAG_NONE, []() {
 		if (g_pMapVoteSystem->GetDownloadQueueSize() == 0)
@@ -1417,7 +1569,25 @@ std::pair<int, std::shared_ptr<CMap>> CMapVoteSystem::GetMapInfoByIdentifiers(co
 	return {-1, nullptr};
 }
 
-std::shared_ptr<CMapSystemWorkshopDetailsQuery> CMapSystemWorkshopDetailsQuery::Create(uint64 iWorkshopId, CCSPlayerController* pController, QueryCallback_t callbackSuccess)
+bool CMapSystemWorkshopDetailsQuery::HasCS2MapTags(const char* pszTags)
+{
+	// Tags are a comma separated list, e.g. "Custom,Map,Cs2"
+	bool bCS2 = false, bMap = false;
+	std::stringstream stream(pszTags);
+	std::string strTag;
+
+	while (std::getline(stream, strTag, ','))
+	{
+		if (!V_stricmp(strTag.c_str(), "Cs2"))
+			bCS2 = true;
+		else if (!V_stricmp(strTag.c_str(), "Map"))
+			bMap = true;
+	}
+
+	return bCS2 && bMap;
+}
+
+std::shared_ptr<CMapSystemWorkshopDetailsQuery> CMapSystemWorkshopDetailsQuery::Create(uint64 iWorkshopId, CCSPlayerController* pController, QueryCallback_t callbackSuccess, bool bRequireCS2Map)
 {
 	if (!GetSteamUGC())
 	{
@@ -1445,6 +1615,7 @@ std::shared_ptr<CMapSystemWorkshopDetailsQuery> CMapSystemWorkshopDetailsQuery::
 	}
 
 	auto pQuery = std::make_shared<CMapSystemWorkshopDetailsQuery>(hQuery, iWorkshopId, pController, callbackSuccess);
+	pQuery->m_bRequireCS2Map = bRequireCS2Map;
 	g_pMapVoteSystem->AddWorkshopDetailsQuery(pQuery);
 	pQuery->m_CallResult.Set(hCall, pQuery.get(), &CMapSystemWorkshopDetailsQuery::OnQueryCompleted);
 
@@ -1478,6 +1649,12 @@ void CMapSystemWorkshopDetailsQuery::OnQueryCompleted(SteamUGCQueryCompleted_t* 
 	{
 		if (bMapLookupActive)
 			ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "The ID \x06%llu\x01 is not a valid CS2 workshop map.", m_iWorkshopId);
+	}
+	else if (m_bRequireCS2Map && !HasCS2MapTags(details.m_rgchTags))
+	{
+		// Legacy CS:GO workshop items share app ID 730 but can't be loaded in CS2, CS2 maps are tagged "Cs2" & "Map"
+		if (bMapLookupActive)
+			ClientPrint(pController, HUD_PRINTTALK, CHAT_PREFIX "The ID \x06%llu\x01 is not a CS2 workshop map (it may be a CS:GO map).", m_iWorkshopId);
 	}
 	else
 	{

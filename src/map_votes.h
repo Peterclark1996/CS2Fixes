@@ -88,6 +88,9 @@ public:
 	int GetMaxPlayers() { return m_iMaxPlayers; };
 	std::vector<std::string> GetGroups() { return m_vecGroups; };
 	bool HasGroup(std::string strGroup) { return std::find(m_vecGroups.begin(), m_vecGroups.end(), strGroup) != m_vecGroups.end(); };
+	// Added by a player nominating a workshop ID that isn't in maplist.jsonc; only appears in votes when nominated
+	bool IsWorkshopNomination() { return m_bWorkshopNomination; };
+	void SetWorkshopNomination(bool bValue) { m_bWorkshopNomination = bValue; };
 
 	bool IsAvailable();
 	bool Load();
@@ -109,6 +112,7 @@ private:
 	int m_iMaxPlayers;
 	float m_fCustomCooldown;
 	std::vector<std::string> m_vecGroups;
+	bool m_bWorkshopNomination = false;
 };
 
 class CGroup
@@ -148,11 +152,15 @@ public:
 		}
 	}
 
-	static std::shared_ptr<CMapSystemWorkshopDetailsQuery> Create(uint64 iWorkshopId, CCSPlayerController* pController = nullptr, QueryCallback_t callbackSuccess = nullptr);
+	// bRequireCS2Map: also reject items without the "Cs2" & "Map" tags (e.g. legacy CS:GO workshop maps)
+	static std::shared_ptr<CMapSystemWorkshopDetailsQuery> Create(uint64 iWorkshopId, CCSPlayerController* pController = nullptr, QueryCallback_t callbackSuccess = nullptr, bool bRequireCS2Map = false);
 	static void ReportCreateFailure(uint64 iWorkshopId, CCSPlayerController* pController, QueryCallback_t callbackSuccess);
+	static bool HasCS2MapTags(const char* pszTags);
 
 private:
 	void OnQueryCompleted(SteamUGCQueryCompleted_t* pCompletedQuery, bool bFailed);
+
+	bool m_bRequireCS2Map = false;
 
 	UGCQueryHandle_t m_hQuery;
 	CCallResult<CMapSystemWorkshopDetailsQuery, SteamUGCQueryCompleted_t> m_CallResult;
@@ -188,6 +196,9 @@ public:
 	std::string GetMapCooldownText(const char* pszMapName, bool bPlural);
 	void PutMapOnCooldown(const char* pszMapName, float fCooldown = 0.0f);
 	void AttemptNomination(CCSPlayerController* pController, const char* pszMapSubstring);
+	void NominateMap(CCSPlayerController* pController, std::shared_ptr<CMap> pMap);
+	int AddWorkshopNominationMap(const char* pszTitle, uint64 iWorkshopId);
+	int GetWorkshopNominationMapCount();
 	void PrintMapList(CCSPlayerController* pController);
 	int GetTotalNominations(int iMapIndex);
 	void ForceNextMap(CCSPlayerController* pController, const char* pszMapSubstring);
